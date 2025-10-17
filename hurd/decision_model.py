@@ -4,16 +4,8 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 import numpy as np
-
-import jax
-from jax.config import config
-config.update("jax_debug_nans", True)
-jax.config.update("jax_debug_infs", True)
-config.update("jax_enable_x64", True)
-# config.update('jax_disable_jit', True)
-
-import jax.numpy as jnp
-from jax.nn import sigmoid, softmax
+import torch
+import torch.nn.functional as F
 
 from .utils import mkdir
 from .initializer import initializer
@@ -27,6 +19,7 @@ class DecisionModelBase(ABC):
         stochastic_spec="softmax",  # "softmax" (logit) or "constant-error"
         optimizer=None,
         verbose=2,
+        device=None,
     ):
         self.id = "DecisionModelBase"
         self.stochastic_spec = stochastic_spec
@@ -38,6 +31,15 @@ class DecisionModelBase(ABC):
         self.has_validation_data = False
         # assume no data sorting is needed until specified
         self.required_sort = "none"
+        
+        # Set device (cuda if available and not specified, else cpu)
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+        
+        if self.verbose > 0:
+            print(f"Using device {self.device} for model {self.id}")
 
         # either we send utils into a softmax with temperature
         # or we use a constant error term for strict (binary) preferences
@@ -46,7 +48,12 @@ class DecisionModelBase(ABC):
             self.T = 1.0
 
             def softmax_error(utils, T):
-                return softmax(utils * T)
+                if not isinstance(utils, torch.Tensor):
+                    utils = torch.from_numpy(utils).float()
+                # T might be a tensor parameter, ensure utils is on same device
+                if isinstance(T, torch.Tensor):
+                    utils = utils.to(T.device)
+                return F.softmax(utils * T, dim=-1)
 
             self.stochastic_func = softmax_error
 
@@ -57,16 +64,23 @@ class DecisionModelBase(ABC):
                 # (PAGE 3) He, L., Zhao, W. J., & Bhatia, S. (2020).
                 # An ontology of decision models. Psychological Review.
 
-                # just a jax compatible way to set binary
+                # just a torch compatible way to set binary
                 # decisions to 1-(mu/2) and mu/2
                 # ex: [pick_A, pick_B] -> [0, 1] -> ...
                 #     prob_pick_A, prob_pick_B] -> [0.1, 0.9]
                 # utils are first turned into binary decisions
-                error = sigmoid(mu) / 2.0
-                p_a = (utils[:, 0] >= utils[:, 1]) * (1.0 - error)
-                p_a += (utils[:, 0] < utils[:, 1]) * error
+                if not isinstance(utils, torch.Tensor):
+                    utils = torch.from_numpy(utils).float()
+                # Preserve gradient if mu is already a tensor
+                mu_t = mu if isinstance(mu, torch.Tensor) else torch.tensor(mu, dtype=torch.float32)
+                # Ensure utils is on same device as mu_t
+                if isinstance(mu_t, torch.Tensor):
+                    utils = utils.to(mu_t.device)
+                error = torch.sigmoid(mu_t) / 2.0
+                p_a = (utils[:, 0] >= utils[:, 1]).float() * (1.0 - error)
+                p_a += (utils[:, 0] < utils[:, 1]).float() * error
                 p_b = 1 - p_a
-                return jnp.vstack([p_a, p_b]).T
+                return torch.vstack([p_a, p_b]).T
 
             self.stochastic_func = constant_error
 
@@ -118,6 +132,13 @@ class DecisionModelBase(ABC):
 
         preds = self.predict(dataset=dataset)
         b_preds = preds[:, 1]
+        
+        # Convert to numpy if torch tensors
+        if isinstance(b_preds, torch.Tensor):
+            b_preds = b_preds.cpu().detach().numpy()
+        if isinstance(targets, torch.Tensor):
+            targets = targets.cpu().detach().numpy()
+            
         return np.sum((b_preds > 0.5) == (targets > 0.5)) / b_preds.size
 
     def fit(self, dataset, val_dataset=None, batch_size=None):
@@ -142,7 +163,7 @@ class DecisionModelBase(ABC):
             step_results = self.optimizer.step(ix)
 
             if self.optimizer.tolerance:
-                if not step_results["is_improvement"]:
+                if not step_results["improvement"]:
                     n_iters_no_progress += 1
                     if n_iters_no_progress >= self.optimizer.patience:
                         break

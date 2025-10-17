@@ -1,15 +1,13 @@
 import numpy as np
 
-import jax
-import jax.numpy as jnp
-from jax import vmap
-from jax.nn import relu, sigmoid, softmax
+import torch
+import torch.nn.functional as F
 
 from ..decision_model import DecisionModelBase
 from .psychophysical import PsychophysicalModel
 
 from ..utils import glorot_uniform_init, setup_plotting
-from ..jax_utils import select_array_inputs
+from ..torch_utils import select_array_inputs
 
 
 class MixtureOfTheories(DecisionModelBase):
@@ -86,6 +84,9 @@ class MixtureOfTheories(DecisionModelBase):
         else:
             self.uf_mixer_params["uf_w2"] = glorot_uniform_init(self.n_models, 1)
             self.uf_mixer_params["uf_b2"] = np.zeros(self.n_models)
+        
+        # Cache for tensor versions of parameters on device
+        self._uf_mixer_tensors = {}
 
         # if input_size > 1:
         #     # hack to get hidden activations
@@ -99,24 +100,35 @@ class MixtureOfTheories(DecisionModelBase):
         # if input_size > 1:
         #     self.get_hidden = vmap(get_hidden)
 
-        def uf_mixer_nn(outcome):
+        # CRITICAL PERFORMANCE FIX: Batch operations instead of per-sample
+        def uf_mixer_batched(outcomes):
+            # Use cached tensor parameters (already on device)
+            w1 = self._uf_mixer_tensors.get("uf_w1")
+            w2 = self._uf_mixer_tensors.get("uf_w2")
+            b1 = self._uf_mixer_tensors.get("uf_b1")
+            b2 = self._uf_mixer_tensors.get("uf_b2")
+            
+            # outcomes is already a tensor on correct device from select_array_inputs
+            # Shape: (batch_size, input_size)
             if input_size > 1:
-                hidden = sigmoid(
-                    jnp.dot(self.uf_mixer_params["uf_w1"], outcome)
-                    + self.uf_mixer_params["uf_b1"]
+                # Batch matrix multiplication: (batch_size, input_size) @ (input_size, n_units)
+                hidden = torch.sigmoid(
+                    torch.matmul(outcomes, w1.T) + b1
                 )
-                output = softmax(
-                    jnp.dot(self.uf_mixer_params["uf_w2"], hidden)
-                    + self.uf_mixer_params["uf_b2"]
+                # (batch_size, n_units) @ (n_units, n_models)
+                output = F.softmax(
+                    torch.matmul(hidden, w2.T) + b2,
+                    dim=-1
                 )
             else:
-                output = softmax(
-                    jnp.dot(self.uf_mixer_params["uf_w2"], outcome)
-                    + self.uf_mixer_params["uf_b2"]
+                # (batch_size, 1) @ (1, n_models)
+                output = F.softmax(
+                    torch.matmul(outcomes, w2.T) + b2,
+                    dim=-1
                 )
             return output
-
-        self.uf_mixer = vmap(uf_mixer_nn)
+        
+        self.uf_mixer = uf_mixer_batched
 
         self.pwf_mixer_params = {}
         # to connect inputs (both gambles) to hidden layer
@@ -132,46 +144,86 @@ class MixtureOfTheories(DecisionModelBase):
         else:
             self.pwf_mixer_params["pwf_w2"] = glorot_uniform_init(self.n_models, 1)
             self.pwf_mixer_params["pwf_b2"] = np.zeros(self.n_models)
+        
+        # Cache for tensor versions of parameters on device
+        self._pwf_mixer_tensors = {}
 
         if not self.share_mixers:
-
-            def pwf_mixer_nn(outcome):
+            # CRITICAL PERFORMANCE FIX: Batch operations instead of per-sample
+            def pwf_mixer_batched(outcomes):
+                # Use cached tensor parameters (already on device)
+                w1 = self._pwf_mixer_tensors.get("pwf_w1")
+                w2 = self._pwf_mixer_tensors.get("pwf_w2")
+                b1 = self._pwf_mixer_tensors.get("pwf_b1")
+                b2 = self._pwf_mixer_tensors.get("pwf_b2")
+                
+                # outcomes is already a tensor on correct device
+                # Shape: (batch_size, input_size)
                 if input_size > 1:
-                    hidden = sigmoid(
-                        jnp.dot(self.pwf_mixer_params["pwf_w1"], outcome)
-                        + self.pwf_mixer_params["pwf_b1"]
+                    hidden = torch.sigmoid(
+                        torch.matmul(outcomes, w1.T) + b1
                     )
-                    output = softmax(
-                        jnp.dot(self.pwf_mixer_params["pwf_w2"], hidden)
-                        + self.pwf_mixer_params["pwf_b2"]
+                    output = F.softmax(
+                        torch.matmul(hidden, w2.T) + b2,
+                        dim=-1
                     )
                 else:
-                    output = softmax(
-                        jnp.dot(self.pwf_mixer_params["pwf_w2"], outcome)
-                        + self.pwf_mixer_params["pwf_b2"]
+                    output = F.softmax(
+                        torch.matmul(outcomes, w2.T) + b2,
+                        dim=-1
                     )
                 return output
 
         else:
-
-            def pwf_mixer_nn(outcome):
+            # CRITICAL PERFORMANCE FIX: Batch operations, shared weights with uf_mixer
+            def pwf_mixer_batched(outcomes):
+                # Use cached tensor parameters (already on device) - shared with uf_mixer
+                w1 = self._uf_mixer_tensors.get("uf_w1")
+                w2 = self._pwf_mixer_tensors.get("pwf_w2")
+                b1 = self._uf_mixer_tensors.get("uf_b1")
+                b2 = self._pwf_mixer_tensors.get("pwf_b2")
+                
+                # outcomes is already a tensor on correct device
+                # Shape: (batch_size, input_size)
                 if input_size > 1:
-                    hidden = sigmoid(
-                        jnp.dot(self.uf_mixer_params["uf_w1"], outcome)
-                        + self.uf_mixer_params["uf_b1"]
+                    hidden = torch.sigmoid(
+                        torch.matmul(outcomes, w1.T) + b1
                     )
-                    output = softmax(
-                        jnp.dot(self.pwf_mixer_params["pwf_w2"], hidden)
-                        + self.pwf_mixer_params["pwf_b2"]
+                    output = F.softmax(
+                        torch.matmul(hidden, w2.T) + b2,
+                        dim=-1
                     )
                 else:
-                    output = softmax(
-                        jnp.dot(self.pwf_mixer_params["pwf_w2"], outcome)
-                        + self.pwf_mixer_params["pwf_b2"]
+                    output = F.softmax(
+                        torch.matmul(outcomes, w2.T) + b2,
+                        dim=-1
                     )
                 return output
+        
+        self.pwf_mixer = pwf_mixer_batched
+        
+        # Initialize tensor cache
+        self._sync_mixer_tensors()
 
-        self.pwf_mixer = vmap(pwf_mixer_nn)
+    def _sync_mixer_tensors(self):
+        """Convert mixer parameters to tensors and cache them on device for efficiency"""
+        # Cache uf_mixer tensors
+        for key in ["uf_w1", "uf_w2", "uf_b1", "uf_b2"]:
+            val = self.uf_mixer_params.get(key)
+            if val is not None:
+                if isinstance(val, torch.Tensor):
+                    self._uf_mixer_tensors[key] = val.to(self.device)
+                else:
+                    self._uf_mixer_tensors[key] = torch.from_numpy(val).float().to(self.device)
+        
+        # Cache pwf_mixer tensors
+        for key in ["pwf_w1", "pwf_w2", "pwf_b1", "pwf_b2"]:
+            val = self.pwf_mixer_params.get(key)
+            if val is not None:
+                if isinstance(val, torch.Tensor):
+                    self._pwf_mixer_tensors[key] = val.to(self.device)
+                else:
+                    self._pwf_mixer_tensors[key] = torch.from_numpy(val).float().to(self.device)
 
     def _infer_mixture_weights(self, dataset):
         """ for internal use only"""
@@ -188,7 +240,7 @@ class MixtureOfTheories(DecisionModelBase):
 
         # the input to the mixer(s) is either one big, flat matrix
         # with all gamble pair information or subset we choose
-        mixer_inputs = select_array_inputs(outcomes, probabilities, inputs=self.inputs)
+        mixer_inputs = select_array_inputs(outcomes, probabilities, inputs=self.inputs, device=self.device)
 
         # infer the convex mixture weights
         uf_convex_weights = self.uf_mixer(mixer_inputs)
@@ -215,6 +267,29 @@ class MixtureOfTheories(DecisionModelBase):
             uf_convex_weights,
             pwf_convex_weights,
         ) = self._infer_mixture_weights(dataset)
+        
+        # Convert to torch if needed and move to device
+        # (outcomes/probabilities should already be tensors from dataset.as_array)
+        if not isinstance(outcomes, torch.Tensor):
+            outcomes = torch.from_numpy(outcomes).float().to(self.device)
+        elif outcomes.device != self.device:
+            outcomes = outcomes.to(self.device)
+            
+        if not isinstance(probabilities, torch.Tensor):
+            probabilities = torch.from_numpy(probabilities).float().to(self.device)
+        elif probabilities.device != self.device:
+            probabilities = probabilities.to(self.device)
+        
+        # uf_convex_weights and pwf_convex_weights should already be on device from mixer
+        if not isinstance(uf_convex_weights, torch.Tensor):
+            uf_convex_weights = torch.from_numpy(uf_convex_weights).float().to(self.device)
+        elif uf_convex_weights.device != self.device:
+            uf_convex_weights = uf_convex_weights.to(self.device)
+            
+        if not isinstance(pwf_convex_weights, torch.Tensor):
+            pwf_convex_weights = torch.from_numpy(pwf_convex_weights).float().to(self.device)
+        elif pwf_convex_weights.device != self.device:
+            pwf_convex_weights = pwf_convex_weights.to(self.device)
 
         uf1_utils = self.models["EU_1"].utility_fn(outcomes)
         uf2_utils = self.models["EU_2"].utility_fn(outcomes)
@@ -230,39 +305,51 @@ class MixtureOfTheories(DecisionModelBase):
         )
 
         if self.variant == "full":
-            mixed_predictions = jnp.sum(mixed_utils * mixed_probs, axis=2)
+            mixed_predictions = torch.sum(mixed_utils * mixed_probs, axis=2)
         elif self.variant == "single_pwf":
-            mixed_predictions = jnp.sum(mixed_utils * pwf1_weights, axis=2)
+            mixed_predictions = torch.sum(mixed_utils * pwf1_weights, axis=2)
         elif self.variant == "single_uf":
-            mixed_predictions = jnp.sum(uf1_utils * mixed_probs, axis=2)
+            mixed_predictions = torch.sum(uf1_utils * mixed_probs, axis=2)
         elif self.variant == "simulate_PT":
-            mixed_predictions = jnp.sum(uf1_utils * pwf1_weights, axis=2)
+            mixed_predictions = torch.sum(uf1_utils * pwf1_weights, axis=2)
 
         mixed_predictions = self.decision_function(mixed_predictions)
 
         if self.include_dom:
-            mixed_predictions *= jnp.vstack(
-                [1 - self.B_dominated, 1 - self.B_dominated]
+            if not isinstance(self.B_dominated, torch.Tensor):
+                B_dominated = torch.from_numpy(self.B_dominated).float().to(self.device)
+                A_dominated = torch.from_numpy(self.A_dominated).float().to(self.device)
+            elif self.B_dominated.device != self.device:
+                B_dominated = self.B_dominated.to(self.device)
+                A_dominated = self.A_dominated.to(self.device)
+            else:
+                # Already on correct device
+                B_dominated = self.B_dominated
+                A_dominated = self.A_dominated
+                
+            mixed_predictions = mixed_predictions * torch.vstack(
+                [1 - B_dominated, 1 - B_dominated]
             ).T
-            mixed_predictions *= jnp.vstack(
-                [1 - self.A_dominated, 1 - self.A_dominated]
+            mixed_predictions = mixed_predictions * torch.vstack(
+                [1 - A_dominated, 1 - A_dominated]
             ).T
-            mixed_predictions += jnp.vstack(
+            mixed_predictions = mixed_predictions + torch.vstack(
                 [
-                    self.B_dominated * self.prob_pick_dominated,
-                    self.B_dominated * (1 - self.prob_pick_dominated),
+                    B_dominated * self.prob_pick_dominated,
+                    B_dominated * (1 - self.prob_pick_dominated),
                 ]
             ).T
-            mixed_predictions += jnp.vstack(
+            mixed_predictions = mixed_predictions + torch.vstack(
                 [
-                    self.A_dominated * (1 - self.prob_pick_dominated),
-                    self.A_dominated * self.prob_pick_dominated,
+                    A_dominated * (1 - self.prob_pick_dominated),
+                    A_dominated * self.prob_pick_dominated,
                 ]
             ).T
 
         return mixed_predictions
 
     def set_params(self, params):
+        # Store original set_params logic but also update cached tensors
 
         for model_key in self.models.keys():
             self.models[model_key].set_params(params[model_key])
@@ -274,6 +361,9 @@ class MixtureOfTheories(DecisionModelBase):
 
             for mixer_params_key in self.pwf_mixer_params.keys():
                 self.pwf_mixer_params[mixer_params_key] = params[mixer_params_key]
+            
+            # Update cached tensors after parameters change
+            self._sync_mixer_tensors()
 
         if self.include_dom:
             self.prob_pick_dominated = params["prob_pick_dominated"]

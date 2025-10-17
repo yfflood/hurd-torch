@@ -1,7 +1,5 @@
 import numpy as np
-
-import jax.numpy as jnp
-from jax import vmap
+import torch
 
 from ..decision_model import DecisionModelBase
 
@@ -55,12 +53,22 @@ class PsychophysicalModel(DecisionModelBase):
             outcomes, probabilities = dataset["outcomes"], dataset["probabilities"]
         else:
             outcomes, probabilities = dataset.as_array(sort=self.required_sort)
+        
+        # Convert to torch tensors if needed and move to device (only if not already on correct device)
+        if not isinstance(outcomes, torch.Tensor):
+            outcomes = torch.from_numpy(outcomes).float().to(self.device)
+        elif outcomes.device != self.device:
+            outcomes = outcomes.to(self.device)
+        if not isinstance(probabilities, torch.Tensor):
+            probabilities = torch.from_numpy(probabilities).float().to(self.device)
+        elif probabilities.device != self.device:
+            probabilities = probabilities.to(self.device)
 
         U, W = self.utility_fn, self.weight_fn
 
         outcomes, probabilities = U(outcomes), W(probabilities)
 
-        utils = jnp.sum(outcomes * probabilities, axis=2)
+        utils = torch.sum(outcomes * probabilities, axis=2)
 
         return self.decision_function(utils)
 
@@ -109,19 +117,19 @@ class CumulativeProspectTheoryModel(PsychophysicalModel):
         WP, WN = self.weight_fn_pos, self.weight_fn_neg
 
         def get_val():
-            ld_p_cumsum = WN(jnp.clip(jnp.cumsum(probs), 0, 1))
-            ld_p = jnp.hstack([ld_p_cumsum[0], ld_p_cumsum[1:] - ld_p_cumsum[:-1]])
-            ld_p *= outcomes * ld_mask
+            ld_p_cumsum = WN(torch.clamp(torch.cumsum(probs, dim=0), 0, 1))
+            ld_p = torch.hstack([ld_p_cumsum[0].unsqueeze(0), ld_p_cumsum[1:] - ld_p_cumsum[:-1]])
+            ld_p = ld_p * outcomes * ld_mask
             return ld_p
 
-        ld_p = jnp.where(ld_mask[0] != 0, get_val(), 0)
+        ld_p = torch.where(ld_mask[0] != 0, get_val(), torch.zeros_like(outcomes))
 
         gd_mask = 1 - ld_mask
-        gd_p_cumsum = WP(jnp.clip(jnp.cumsum(probs * gd_mask), 0, 1))
-        gd_p = jnp.hstack([gd_p_cumsum[0], gd_p_cumsum[1:] - gd_p_cumsum[:-1]])
-        gd_p *= outcomes * gd_mask
+        gd_p_cumsum = WP(torch.clamp(torch.cumsum(probs * gd_mask, dim=0), 0, 1))
+        gd_p = torch.hstack([gd_p_cumsum[0].unsqueeze(0), gd_p_cumsum[1:] - gd_p_cumsum[:-1]])
+        gd_p = gd_p * outcomes * gd_mask
 
-        return jnp.sum(ld_p) + jnp.sum(gd_p)
+        return torch.sum(ld_p) + torch.sum(gd_p)
 
     def predict(self, dataset):
 
@@ -129,6 +137,20 @@ class CumulativeProspectTheoryModel(PsychophysicalModel):
             outcomes, probabilities = dataset["outcomes"], dataset["probabilities"]
         else:
             outcomes, probabilities = dataset.as_array(sort=self.required_sort)
+        
+        # Convert to torch if not already and move to device (only if not already on correct device)
+        if not isinstance(outcomes, torch.Tensor):
+            outcomes_np = outcomes
+            outcomes = torch.from_numpy(outcomes).float().to(self.device)
+        else:
+            outcomes_np = outcomes.cpu().numpy()
+            if outcomes.device != self.device:
+                outcomes = outcomes.to(self.device)
+        
+        if not isinstance(probabilities, torch.Tensor):
+            probabilities = torch.from_numpy(probabilities).float().to(self.device)
+        elif probabilities.device != self.device:
+            probabilities = probabilities.to(self.device)
 
         # most of the following to find first positive outcomes
         # do all searchsorts in advance
@@ -136,41 +158,42 @@ class CumulativeProspectTheoryModel(PsychophysicalModel):
             return [np.searchsorted(x[0], 0), np.searchsorted(x[1], 0)]
 
         ld_masks = []
-        for i in range(outcomes.shape[0]):
-            first_pos = searchsort(outcomes[i])
+        for i in range(outcomes_np.shape[0]):
+            first_pos = searchsort(outcomes_np[i])
             ld_masks.append(
                 [
                     np.hstack(
                         [
                             np.ones(first_pos[0]),
-                            np.zeros(outcomes.shape[2] - first_pos[0]),
+                            np.zeros(outcomes_np.shape[2] - first_pos[0]),
                         ]
                     ),
                     np.hstack(
                         [
                             np.ones(first_pos[1]),
-                            np.zeros(outcomes.shape[2] - first_pos[1]),
+                            np.zeros(outcomes_np.shape[2] - first_pos[1]),
                         ]
                     ),
                 ]
             )
 
-        ld_masks = np.array(ld_masks)
+        ld_masks = torch.from_numpy(np.array(ld_masks)).float().to(self.device)
 
         # pre-apply utility function
         outcomes = self.utility_fn(outcomes)
 
-        value_per_gamble = vmap(self.value_per_gamble)
+        # PyTorch vmap equivalent using list comprehension
+        gambleA_values = torch.stack([
+            self.value_per_gamble(probabilities[i, 0], outcomes[i, 0], ld_masks[i, 0])
+            for i in range(probabilities.shape[0])
+        ])
 
-        gambleA_values = value_per_gamble(
-            probabilities[:, 0], outcomes[:, 0], ld_masks[:, 0]
-        )
+        gambleB_values = torch.stack([
+            self.value_per_gamble(probabilities[i, 1], outcomes[i, 1], ld_masks[i, 1])
+            for i in range(probabilities.shape[0])
+        ])
 
-        gambleB_values = value_per_gamble(
-            probabilities[:, 1], outcomes[:, 1], ld_masks[:, 1]
-        )
-
-        return self.decision_function(jnp.vstack([gambleA_values, gambleB_values]).T)
+        return self.decision_function(torch.vstack([gambleA_values, gambleB_values]).T)
 
     def get_params(self):
         params = {}
@@ -222,7 +245,7 @@ class TransferOfAttentionExchangeModel(DecisionModelBase):
         super().__init__(**kwargs)
         self.id = "TransferOfAttentionExchange"
 
-        # for TAX, otucomes must be ordered smallest to largest
+        # for TAX, outcomes must be ordered smallest to largest
         self.required_sort = "outcomes_asc"
 
         # single parameter for the power weighting function
@@ -257,40 +280,50 @@ class TransferOfAttentionExchangeModel(DecisionModelBase):
             outcomes, probabilities = dataset["outcomes"], dataset["probabilities"]
         else:
             outcomes, probabilities = dataset.as_array(sort=self.required_sort)
+        
+        # Convert to torch if not already and move to device
+        if not isinstance(outcomes, torch.Tensor):
+            outcomes = torch.from_numpy(outcomes).float().to(self.device)
+        else:
+            outcomes = outcomes.to(self.device)
+        if not isinstance(probabilities, torch.Tensor):
+            probabilities = torch.from_numpy(probabilities).float().to(self.device)
+        else:
+            probabilities = probabilities.to(self.device)
 
         # apply power utility function
-        signs = jnp.sign(outcomes)
-        absolute_outcomes = jnp.abs(outcomes)
+        signs = torch.sign(outcomes)
+        absolute_outcomes = torch.abs(outcomes)
         utilities = signs * absolute_outcomes ** self.beta
 
         # apply power probability weighting function
         weighted_probs = probabilities ** self.gamma
 
         # first part of model is just subjective expected utility
-        seu = jnp.sum(utilities * weighted_probs, axis=2)
+        seu = torch.sum(utilities * weighted_probs, axis=2)
 
         # takes a single gamble and returns the TAX term
         def per_gamble_TAX_sum(outcomes, probs):
 
             # array length
-            n = outcomes.size
+            n = outcomes.numel()
 
             # mask for the real outcomes (excludes zero padding)
-            non_padding_mask = ~((probs == 0.0) & (outcomes == 0.0)) * 1.0
+            non_padding_mask = (~((probs == 0.0) & (outcomes == 0.0))).float()
             # actual number of outcomes without zero-padding
-            m = jnp.sum(non_padding_mask)
+            m = torch.sum(non_padding_mask)
             # helps remove the bad terms later due to the zero padding
-            remove_mask = jnp.outer(non_padding_mask, jnp.ones(n - 1))[1:]
+            remove_mask = torch.outer(non_padding_mask, torch.ones(n - 1))[1:]
 
             # i and j outcomes in the tax model formula
             x_i, x_j = outcomes[1:], outcomes[:-1]
 
-            x_i_outer = jnp.outer(x_i, jnp.ones(n - 1))
-            x_j_outer = jnp.outer(x_j, jnp.ones(n - 1)).T
+            x_i_outer = torch.outer(x_i, torch.ones(n - 1))
+            x_j_outer = torch.outer(x_j, torch.ones(n - 1)).T
 
             xij_diffs = x_i_outer - x_j_outer
             # make sure to remove useless upper echelon
-            xij_diffs = xij_diffs * jnp.triu(jnp.ones((n - 1, n - 1))).T
+            xij_diffs = xij_diffs * torch.triu(torch.ones((n - 1, n - 1))).T
 
             # i and j probabilities in the tax model formula
             p_i, p_j = probs[1:], probs[:-1]
@@ -301,26 +334,31 @@ class TransferOfAttentionExchangeModel(DecisionModelBase):
             pj_weights = (p_j * self.delta) / (m + 1)
 
             # need to make them align with xij_diffs
-            p_i_outer = jnp.outer(pi_weights, jnp.ones(n - 1))
-            p_j_outer = jnp.outer(pj_weights, jnp.ones(n - 1)).T
+            p_i_outer = torch.outer(pi_weights, torch.ones(n - 1))
+            p_j_outer = torch.outer(pj_weights, torch.ones(n - 1)).T
 
             # selecting one weight set or the other
-            delta_is_neg = (self.delta < 0) * 1.0
+            delta_is_neg = float(self.delta < 0)
             weights = p_i_outer * delta_is_neg + p_j_outer * (1 - delta_is_neg)
 
             tax_sum_terms = xij_diffs * weights * remove_mask
 
-            tax_sum = jnp.sum(tax_sum_terms)
+            tax_sum = torch.sum(tax_sum_terms)
 
             return tax_sum
 
-        per_gamble_TAX_sum = vmap(per_gamble_TAX_sum)
+        # PyTorch vmap equivalent using list comprehension
+        gambleA_tax_sums = torch.stack([
+            per_gamble_TAX_sum(weighted_probs[i, 0], utilities[i, 0])
+            for i in range(weighted_probs.shape[0])
+        ])
+        gambleB_tax_sums = torch.stack([
+            per_gamble_TAX_sum(weighted_probs[i, 1], utilities[i, 1])
+            for i in range(weighted_probs.shape[0])
+        ])
 
-        gambleA_tax_sums = per_gamble_TAX_sum(weighted_probs[:, 0], utilities[:, 0])
-        gambleB_tax_sums = per_gamble_TAX_sum(weighted_probs[:, 1], utilities[:, 1])
+        tax_sums = torch.vstack([gambleA_tax_sums, gambleB_tax_sums]).T
 
-        tax_sums = jnp.vstack([gambleA_tax_sums, gambleB_tax_sums]).T
-
-        final_utils = (seu + tax_sums) / jnp.sum(weighted_probs, axis=2)
+        final_utils = (seu + tax_sums) / torch.sum(weighted_probs, axis=2)
 
         return self.decision_function(final_utils)

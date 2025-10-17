@@ -52,15 +52,31 @@ def select_array_inputs(outcomes, probabilities, inputs="both"):
         raise ValueError("invalid arg for inputs")
 
 
-def fix_jax_dict_floats(dict_):
+def fix_torch_dict_floats(dict_):
+    """Convert torch tensors and other numeric types to standard Python floats/arrays"""
+    import torch
     new_dict_ = {}
     for key, val in dict_.items():
-        try:
-            fixed_val = float(val)
-            new_dict_[key] = fixed_val
-        except:
-            new_dict_[key] = dict_[key]
+        if isinstance(val, dict):
+            # Recursively handle nested dicts
+            new_dict_[key] = fix_torch_dict_floats(val)
+        elif isinstance(val, torch.Tensor):
+            # Convert torch tensors
+            if val.ndim == 0:
+                new_dict_[key] = val.item()
+            else:
+                new_dict_[key] = val.detach().cpu().numpy()
+        else:
+            try:
+                fixed_val = float(val)
+                new_dict_[key] = fixed_val
+            except:
+                new_dict_[key] = val
     return new_dict_
+
+
+# Keep old name for backwards compatibility
+fix_jax_dict_floats = fix_torch_dict_floats
 
 
 def mkdir(fp):

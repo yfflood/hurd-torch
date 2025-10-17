@@ -23,12 +23,17 @@
 from abc import ABC, abstractmethod
 
 import numpy as np
-
-from jax import vmap
-import jax.numpy as jnp
-from jax.nn import sigmoid
+import torch
+import torch.nn.functional as F
 
 from ..utils import glorot_uniform_init, setup_plotting
+
+
+def _ensure_tensor(value):
+    """Convert value to tensor if it isn't already, preserving gradients."""
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.tensor(value, dtype=torch.float32)
 
 
 class UtilityBase(ABC):
@@ -46,25 +51,48 @@ class UtilityBase(ABC):
 
     def __call__(self, outcome):
         if isinstance(outcome, tuple):
-            outcome = jnp.array(outcome)
+            outcome = torch.tensor(outcome, dtype=torch.float32)
+        elif isinstance(outcome, np.ndarray):
+            outcome = torch.from_numpy(outcome).float()
+        elif not isinstance(outcome, torch.Tensor):
+            outcome = torch.tensor(outcome, dtype=torch.float32)
+        
+        # Move to same device if needed (infer from parameters if they exist)
+        if hasattr(self, 'parameters') and self.parameters:
+            # Try to get device from first parameter
+            for param_val in self.parameters.values():
+                if isinstance(param_val, torch.Tensor):
+                    outcome = outcome.to(param_val.device)
+                    break
+        
         return self._forward(outcome)
 
     def apply_pos_and_neg_fns(self, outcomes):
         """Most utility functions are conditioned on the sign on the outcome.
         This function applies the right functions to the pos/neg outcomes.
         """
+        # Ensure outcomes is a torch tensor
+        if not isinstance(outcomes, torch.Tensor):
+            outcomes = torch.from_numpy(outcomes).float()
+        
+        # IMPORTANT: For plotting - ensure outcomes is on same device as parameters
+        # Check if parameters are tensors on a specific device and move outcomes there
+        for param_val in self.parameters.values():
+            if isinstance(param_val, torch.Tensor):
+                outcomes = outcomes.to(param_val.device)
+                break
 
         # it's intentional that neither of these include 0
-        pos_mask = outcomes > 0.0
-        neg_mask = outcomes < 0.0
+        pos_mask = (outcomes > 0.0).float()
+        neg_mask = (outcomes < 0.0).float()
 
         # for many functions, u(0) causes errors in backward pass
         # so we need to do u(1) and throw the results out after
-        pos_outcomes = self.pos_fn(jnp.where(pos_mask, outcomes, 1.0))
-        neg_outcomes = self.neg_fn(jnp.where(neg_mask, outcomes, 1.0))
+        pos_outcomes = self.pos_fn(torch.where(pos_mask.bool(), outcomes, torch.ones_like(outcomes)))
+        neg_outcomes = self.neg_fn(torch.where(neg_mask.bool(), outcomes, torch.ones_like(outcomes)))
 
-        pos_outcomes *= pos_mask
-        neg_outcomes *= neg_mask
+        pos_outcomes = pos_outcomes * pos_mask
+        neg_outcomes = neg_outcomes * neg_mask
 
         return pos_outcomes + neg_outcomes
 
@@ -75,6 +103,11 @@ class UtilityBase(ABC):
         if x is None:
             x = np.linspace(xlim[0], xlim[1], 100)
         y = self._forward(x)
+        
+        # Convert tensor output to numpy for plotting
+        if isinstance(y, torch.Tensor):
+            y = y.detach().cpu().numpy()
+        
         ax.plot(x, y)
         if xlim is not None:
             ax.set_xlim(xlim[0], xlim[1])
@@ -130,10 +163,10 @@ class AsymmetricLinearUtil(UtilityBase):
         alpha = self.parameters["alpha"]
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: alpha * jnp.abs(x)
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * jnp.abs(x)
+        self.pos_fn = lambda x: alpha * torch.abs(x)
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * torch.abs(x)
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -162,10 +195,10 @@ class LinearLossAverseUtil(UtilityBase):
         lambda_ = self.parameters["lambda_"]
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: jnp.abs(x)
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * jnp.abs(x)
+        self.pos_fn = lambda x: torch.abs(x)
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * torch.abs(x)
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -205,24 +238,25 @@ class PowerLossAverseUtil(UtilityBase):
         )
 
         # keep track of strictly positive and strictly negative values
-        pos_mask = outcomes > 0
-        neg_mask = outcomes < 0  # don't want to include 0
+        pos_mask = (outcomes > 0).float()
+        neg_mask = (outcomes < 0).float()  # don't want to include 0
 
         # for outcomes > 0:
         # first set entries <= 0 to 0
         pos_outcomes = outcomes * pos_mask
         # then add a little epsilon to zeros to avoid errors
-        pos_outcomes = pos_outcomes + (~pos_mask * jnp.ones(pos_outcomes.shape))
+        pos_outcomes = pos_outcomes + ((1 - pos_mask) * torch.ones_like(pos_outcomes))
         # now we can transform them
-        # this is a bizarre jax way of doing conditionals:
-        # jnp.where(cond, vals_if_true, vals_if_false)
-        pos_outcomes = jnp.where(
-            alpha > 0,  # if this is true
-            pos_outcomes ** alpha,  # return this matrix
-            jnp.where(  # else evaluate below block
-                alpha == 0, # if this is true
-                jnp.log(pos_outcomes), # return this matrix
-                1 - (1 + pos_outcomes) ** alpha # else return this one
+        # this is pytorch's way of doing conditionals:
+        # torch.where(cond, vals_if_true, vals_if_false)
+        alpha_t = _ensure_tensor(alpha)
+        pos_outcomes = torch.where(
+            alpha_t > 0,  # if this is true
+            pos_outcomes ** alpha_t,  # return this matrix
+            torch.where(  # else evaluate below block
+                alpha_t == 0, # if this is true
+                torch.log(pos_outcomes), # return this matrix
+                1 - (1 + pos_outcomes) ** alpha_t # else return this one
             ),
         )
         # remove the entries <= 0 that had a little epsilon
@@ -235,15 +269,17 @@ class PowerLossAverseUtil(UtilityBase):
         # first set entries >= 0 to 0
         neg_outcomes = outcomes * neg_mask
         # then add a little -epsilon to zeros to avoid errors
-        neg_outcomes = neg_outcomes + (~neg_mask * -jnp.ones(neg_outcomes.shape))
+        neg_outcomes = neg_outcomes + ((1 - neg_mask) * -torch.ones_like(neg_outcomes))
         # now we can transform them
-        neg_outcomes = jnp.where(
-            beta > 0,
-            -lambda_ * (-neg_outcomes) ** beta,
-            jnp.where(
-                beta == 0,
-                -lambda_ * jnp.log(-neg_outcomes),
-                -lambda_ * (1.0 - (1.0 - neg_outcomes) ** beta),
+        beta_t = _ensure_tensor(beta)
+        lambda_t = _ensure_tensor(lambda_)
+        neg_outcomes = torch.where(
+            beta_t > 0,
+            -lambda_t * (-neg_outcomes) ** beta_t,
+            torch.where(
+                beta_t == 0,
+                -lambda_t * torch.log(-neg_outcomes),
+                -lambda_t * (1.0 - (1.0 - neg_outcomes) ** beta_t),
             ),
         )
         # remove the entries >= 0 that had a little -epsilon
@@ -269,30 +305,32 @@ class ExpLossAverseUtil(UtilityBase):
         lambda_, alpha = self.parameters["lambda_"], self.parameters["alpha"]
 
         # keep track of positive and negative values
-        pos_mask = outcomes >= 0
-        neg_mask = ~pos_mask
+        pos_mask = (outcomes >= 0).float()
+        neg_mask = 1 - pos_mask
 
         # first set entries < 0 to 0
         pos_outcomes = outcomes * pos_mask
         # now we can transform them
-        pos_outcomes = jnp.where(
-            alpha > 0,
-            1 - jnp.exp(-alpha * pos_outcomes),
-            jnp.where(alpha == 0, pos_outcomes, jnp.exp(-alpha * pos_outcomes) - 1),
+        alpha_t = _ensure_tensor(alpha)
+        pos_outcomes = torch.where(
+            alpha_t > 0,
+            1 - torch.exp(-alpha_t * pos_outcomes),
+            torch.where(alpha_t == 0, pos_outcomes, torch.exp(-alpha_t * pos_outcomes) - 1),
         )
 
         # first set entries >= 0 to 0
         neg_outcomes = outcomes * neg_mask
         # then add a little -epsilon to zeros to avoid errors
-        neg_outcomes = neg_outcomes + (~neg_mask * -jnp.ones(neg_outcomes.shape))
+        neg_outcomes = neg_outcomes + ((1 - neg_mask) * -torch.ones_like(neg_outcomes))
         # now we can transform them
-        neg_outcomes = jnp.where(
-            alpha > 0,
-            lambda_ * (1 - jnp.exp(-alpha * -neg_outcomes)),
-            jnp.where(
-                alpha == 0,
-                -lambda_ * neg_outcomes,
-                -lambda_ * (jnp.exp(-alpha * -neg_outcomes) - 1),
+        lambda_t = _ensure_tensor(lambda_)
+        neg_outcomes = torch.where(
+            alpha_t > 0,
+            lambda_t * (1 - torch.exp(-alpha_t * -neg_outcomes)),
+            torch.where(
+                alpha_t == 0,
+                -lambda_t * neg_outcomes,
+                -lambda_t * (torch.exp(-alpha_t * -neg_outcomes) - 1),
             ),
         )
 
@@ -324,12 +362,12 @@ class NormExpLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: (1 / alpha) * (1 - jnp.exp(-alpha * jnp.abs(x)))
-        self.neg_fn = lambda x: (-jnp.abs(lambda_) / beta) * (
-            1 - jnp.exp(-beta * jnp.abs(x))
+        self.pos_fn = lambda x: (1 / alpha) * (1 - torch.exp(-alpha * torch.abs(x)))
+        self.neg_fn = lambda x: (-torch.abs(_ensure_tensor(lambda_)) / beta) * (
+            1 - torch.exp(-beta * torch.abs(x))
         )
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -355,12 +393,12 @@ class NormLogLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: (1 / alpha) * jnp.log(1 + alpha * jnp.abs(x))
-        self.neg_fn = lambda x: (-jnp.abs(lambda_) / beta) * jnp.log(
-            1 + beta * jnp.abs(x)
+        self.pos_fn = lambda x: (1 / alpha) * torch.log(1 + alpha * torch.abs(x))
+        self.neg_fn = lambda x: (-torch.abs(_ensure_tensor(lambda_)) / beta) * torch.log(
+            1 + beta * torch.abs(x)
         )
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -386,12 +424,12 @@ class NormPowerLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: (1 / 1 + alpha) * (jnp.abs(x) ** (1 / 1 + alpha))
-        self.neg_fn = lambda x: (-(jnp.abs(lambda_) / 1 + beta)) * (
-            jnp.abs(x) ** (1 / 1 + beta)
+        self.pos_fn = lambda x: (1 / 1 + alpha) * (torch.abs(x) ** (1 / 1 + alpha))
+        self.neg_fn = lambda x: (-(torch.abs(_ensure_tensor(lambda_)) / 1 + beta)) * (
+            torch.abs(x) ** (1 / 1 + beta)
         )
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -413,12 +451,12 @@ class QuadLossAverseUtil(UtilityBase):
         )
 
         # lambda doesn't need to be negated here
-        self.pos_fn = lambda x: jnp.abs(x) - (alpha * (jnp.abs(x) ** 2))
-        self.neg_fn = lambda x: jnp.abs(lambda_) * (
-            jnp.abs(x) - (beta * (jnp.abs(x) ** 2))
+        self.pos_fn = lambda x: torch.abs(x) - (alpha * (torch.abs(x) ** 2))
+        self.neg_fn = lambda x: torch.abs(_ensure_tensor(lambda_)) * (
+            torch.abs(x) - (beta * (torch.abs(x) ** 2))
         )
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -435,10 +473,10 @@ class LogLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: jnp.log(alpha + jnp.abs(x))
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * (jnp.log(beta + jnp.abs(x)))
+        self.pos_fn = lambda x: torch.log(alpha + torch.abs(x))
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * (torch.log(beta + torch.abs(x)))
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -456,12 +494,12 @@ class ExpPowerLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: gamma - jnp.exp(-beta * jnp.abs(x) ** alpha)
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * gamma - jnp.exp(
-            -beta * jnp.abs(x) ** alpha
+        self.pos_fn = lambda x: gamma - torch.exp(-beta * torch.abs(x) ** alpha)
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * gamma - torch.exp(
+            -beta * torch.abs(x) ** alpha
         )
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -479,9 +517,9 @@ class GeneralLinearLossAverseUtil(UtilityBase):
 
         # define positive and negative parts of the function
         self.pos_fn = lambda x: alpha * x
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * beta * x
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * beta * x
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -521,10 +559,10 @@ class GeneralPowerLossAverseUtil(UtilityBase):
         )
 
         # define positive and negative parts of the function
-        self.pos_fn = lambda x: beta * jnp.abs(x) ** alpha
-        self.neg_fn = lambda x: -jnp.abs(lambda_) * ((delta * jnp.abs(x)) ** gamma)
+        self.pos_fn = lambda x: beta * torch.abs(x) ** alpha
+        self.neg_fn = lambda x: -torch.abs(_ensure_tensor(lambda_)) * ((delta * torch.abs(x)) ** gamma)
 
-        # apply utility function in jax-compatible way
+        # apply utility function in torch-compatible way
         return self.apply_pos_and_neg_fns(outcomes)
 
 
@@ -553,17 +591,30 @@ class NeuralNetworkUtil(UtilityBase):
     def _forward(self, outcomes):
         w1, w2 = self.parameters["weights"]
         b1, b2 = self.parameters["biases"]
+        
+        # Convert to tensors if needed
+        if not isinstance(w1, torch.Tensor):
+            w1 = torch.from_numpy(w1).float()
+        if not isinstance(w2, torch.Tensor):
+            w2 = torch.from_numpy(w2).float()
+        if not isinstance(b1, torch.Tensor):
+            b1 = torch.from_numpy(b1).float()
+        if not isinstance(b2, torch.Tensor):
+            b2 = torch.from_numpy(b2).float()
 
         def nn(outcome):
-            # hidden = jnp.tanh(jnp.dot(w1, outcome) + b1)
-            hidden = sigmoid(jnp.dot(w1, outcome) + b1)
-            # output = sigmoid(jnp.dot(w2, hidden) + b2)
-            output = jnp.dot(w2, hidden) + b2
+            # hidden = torch.tanh(torch.matmul(w1, outcome) + b1)
+            hidden = torch.sigmoid(torch.matmul(w1, outcome) + b1)
+            # output = torch.sigmoid(torch.matmul(w2, hidden) + b2)
+            output = torch.matmul(w2, hidden) + b2
             return output
 
-        nn = vmap(nn)
-
+        # PyTorch vmap equivalent using list comprehension and stacking
         orig_shape = outcomes.shape
-        outputs = nn(outcomes.flatten()).reshape(orig_shape)
+        flat_outcomes = outcomes.flatten()
+        
+        # Process each outcome through the network
+        outputs = torch.stack([nn(outcome) for outcome in flat_outcomes])
+        outputs = outputs.reshape(orig_shape)
 
         return outputs

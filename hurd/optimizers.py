@@ -8,15 +8,12 @@ try:
 except:
     from tqdm import tqdm
 
-from jax import jit, grad
-from jax.experimental.optimizers import adam, sgd
-
 from functools import partial
 
-import jax.numpy as jnp
+import torch
 import numpy as np
 
-from hurd.utils import dict2str, fix_jax_dict_floats
+from hurd.utils import dict2str, fix_torch_dict_floats
 
 
 class OptimizerBase(ABC):
@@ -75,10 +72,10 @@ class OptimizerBase(ABC):
 class GradientBasedOptimizer(OptimizerBase):
     def __init__(
         self,
-        alg=sgd,
+        alg="sgd",
         lr=0.1,
         n_iters=10,
-        use_jit=True,
+        use_jit=True,  # Kept for compatibility but not used in PyTorch
         tol=None,
         patience=50,
         **kwargs,
@@ -87,11 +84,11 @@ class GradientBasedOptimizer(OptimizerBase):
         self.id = "GradientBasedOptimizer"
         self.lr = lr
         self.n_iters = n_iters
-        self.use_jit = use_jit
+        self.use_jit = use_jit  # Kept for compatibility
         self.batch_size = None
         self.tolerance = tol
         self.patience = patience
-        self.alg = alg # update algorithm
+        self.alg = alg # update algorithm (sgd or adam)
         self.alg_args = {} # argument inputs for alg
 
     def initialize(self, model, batch_size=None):
@@ -99,63 +96,137 @@ class GradientBasedOptimizer(OptimizerBase):
         self.model = model
         self.batch_size = batch_size
 
-        # get forward pass functions ready for compilation
-
-        def get_train_loss(params):
+        # Convert model parameters to PyTorch tensors
+        params = fix_torch_dict_floats(deepcopy(self.model.get_params()))
+        
+        # Get model device
+        device = self.model.device
+        
+        # Create list of torch parameters that require gradients
+        self.param_dict = {}
+        for key, val in params.items():
+            if isinstance(val, dict):
+                # Nested dictionary (for mixture models)
+                self.param_dict[key] = {}
+                for subkey, subval in val.items():
+                    if isinstance(subval, (list, np.ndarray)):
+                        # Handle arrays/lists
+                        if isinstance(subval, list):
+                            subval = np.array(subval)
+                        tensor = torch.from_numpy(subval).float().to(device).requires_grad_(True)
+                    else:
+                        tensor = torch.tensor(float(subval), device=device, requires_grad=True)
+                    self.param_dict[key][subkey] = tensor
+            elif isinstance(val, (list, np.ndarray)):
+                # Handle arrays/lists
+                if isinstance(val, list):
+                    val = np.array(val)
+                tensor = torch.from_numpy(val).float().to(device).requires_grad_(True)
+                self.param_dict[key] = tensor
+            else:
+                self.param_dict[key] = torch.tensor(float(val), device=device, requires_grad=True)
+        
+        self.best_params = deepcopy(params)
+        
+        # Collect all tensors that require gradients
+        self.torch_params = []
+        def collect_tensors(d):
+            for key, val in d.items():
+                if isinstance(val, dict):
+                    collect_tensors(val)
+                elif isinstance(val, torch.Tensor) and val.requires_grad:
+                    self.torch_params.append(val)
+        collect_tensors(self.param_dict)
+        
+        # Create PyTorch optimizer
+        if self.alg == "sgd":
+            self.optimizer = torch.optim.SGD(self.torch_params, lr=self.lr)
+        elif self.alg == "adam":
+            b1 = self.alg_args.get('b1', 0.9)
+            b2 = self.alg_args.get('b2', 0.999)
+            eps = self.alg_args.get('eps', 1e-8)
+            self.optimizer = torch.optim.Adam(self.torch_params, lr=self.lr, 
+                                             betas=(b1, b2), eps=eps)
+        else:
+            raise ValueError(f"Unknown optimizer algorithm: {self.alg}")
+        
+        # Define loss functions
+        def get_train_loss():
+            params = self._extract_params_from_tensors()
             self.model.set_params(params)
-            return self.model.evaluate(self.model.dataset)
+            loss = self.model.evaluate(self.model.dataset)
+            # Convert to tensor if needed, but keep gradients
+            if not isinstance(loss, torch.Tensor):
+                loss = torch.tensor(loss, dtype=torch.float32)
+            return loss
 
-        def get_batch_loss(params, batch):
+        def get_batch_loss(batch):
+            params = self._extract_params_from_tensors()
             self.model.set_params(params)
-            return self.model.evaluate(batch)
+            loss = self.model.evaluate(batch)
+            # Convert to tensor if needed, but keep gradients
+            if not isinstance(loss, torch.Tensor):
+                loss = torch.tensor(loss, dtype=torch.float32)
+            return loss
 
         if self.model.has_validation_data:
-
-            def get_val_loss(params):
-                self.model.set_params(params)
-                return self.model.evaluate(self.model.val_dataset)
-
+            def get_val_loss():
+                with torch.no_grad():
+                    params = self._extract_params_from_tensors()
+                    self.model.set_params(params)
+                    loss = self.model.evaluate(self.model.val_dataset)
+                    if isinstance(loss, torch.Tensor):
+                        return loss.item()
+                    return loss
         else:
-            get_val_loss = get_train_loss
-
-        # we take the gradient with respect to either
-        # all data at once or one batch at a time
+            def get_val_loss():
+                with torch.no_grad():
+                    params = self._extract_params_from_tensors()
+                    self.model.set_params(params)
+                    loss = self.model.evaluate(self.model.dataset)
+                    if isinstance(loss, torch.Tensor):
+                        return loss.item()
+                    return loss
 
         self.get_train_loss = get_train_loss
-        if self.batch_size:
-            self.loss_grad = grad(get_batch_loss)
-        else:
-            self.loss_grad = grad(get_train_loss)
+        self.get_batch_loss = get_batch_loss
         self.get_val_loss = get_val_loss
-
-        self.opt_init, self.opt_update, self.get_params = self.alg(self.lr, **self.alg_args)
-        params = fix_jax_dict_floats(deepcopy(self.model.get_params()))
-        self.optimizer_state = self.opt_init(params)
-        self.best_params = params
-
-        def jit_step(ix, opt_state, batch):
-            current_params = self.get_params(opt_state)
-
-            # take the gradient of the loss function
-            if self.batch_size:
-                grads = self.loss_grad(current_params, batch)
+    
+    def _extract_params_from_tensors(self, detach=False):
+        """Extract parameter values from torch tensors back to dict format
+        
+        Args:
+            detach: If True, detach tensors from computation graph (for saving/logging)
+                   If False, keep tensors attached for gradient computation
+        """
+        params = {}
+        for key, val in self.param_dict.items():
+            if isinstance(val, dict):
+                params[key] = {}
+                for subkey, subval in val.items():
+                    if isinstance(subval, torch.Tensor):
+                        if detach:
+                            if subval.ndim == 0:
+                                params[key][subkey] = subval.item()
+                            else:
+                                params[key][subkey] = subval.detach().cpu().numpy()
+                        else:
+                            # Keep tensor with gradients
+                            params[key][subkey] = subval
+                    else:
+                        params[key][subkey] = subval
+            elif isinstance(val, torch.Tensor):
+                if detach:
+                    if val.ndim == 0:
+                        params[key] = val.item()
+                    else:
+                        params[key] = val.detach().cpu().numpy()
+                else:
+                    # Keep tensor with gradients
+                    params[key] = val
             else:
-                grads = self.loss_grad(current_params)
-
-            # update parameters
-            opt_state = self.opt_update(ix, grads, opt_state)
-            updated_params = self.get_params(opt_state)
-
-            return opt_state, updated_params, grads
-
-        self.jit_step = jit_step
-
-        # compile everything
-        if self.use_jit:
-            self.get_train_loss, self.loss_grad, self.get_val_loss, self.jit_step = map(
-                jit,
-                [self.get_train_loss, self.loss_grad, self.get_val_loss, self.jit_step],
-            )
+                params[key] = val
+        return params
 
     def step(self, ix):
 
@@ -183,34 +254,57 @@ class GradientBasedOptimizer(OptimizerBase):
                     batch.generate_dom_mask()
                     batch_dict["dom_mask"] = batch.dom_mask
 
-                # need to keep track of epochs too so
-                # this doesn't get reset
-                global_index = (ix * n_batches) + bix
-
-                (self.optimizer_state, updated_params, grads) = self.jit_step(
-                    global_index, self.optimizer_state, batch_dict
-                )
+                # PyTorch optimization step
+                self.optimizer.zero_grad()
+                loss = self.get_batch_loss(batch_dict)
+                loss.backward()
+                self.optimizer.step()
 
         else:
+            # Full batch optimization
+            self.optimizer.zero_grad()
+            loss = self.get_train_loss()
+            loss.backward()
+            self.optimizer.step()
 
-            (self.optimizer_state, updated_params, grads) = self.jit_step(
-                ix, self.optimizer_state, None
-            )
-
-        # this is an important line oddly enough.
-        # updated_params replaces the traced arrays that
-        # jax currently has set as the model params.
-        # this allows inference on arbitrary inputs post-training.
+        # Extract updated parameters (detached for evaluation)
+        updated_params = self._extract_params_from_tensors(detach=True)
         self.model.set_params(updated_params)
 
-        train_loss = np.float(self.get_train_loss(updated_params))
-        val_loss = np.float(self.get_val_loss(updated_params))
+        # Evaluate losses (no gradients needed)
+        with torch.no_grad():
+            train_params = self._extract_params_from_tensors(detach=True)
+            self.model.set_params(train_params)
+            train_loss = self.model.evaluate(self.model.dataset)
+            if isinstance(train_loss, torch.Tensor):
+                train_loss = train_loss.item()
+            
+            val_loss = self.get_val_loss()
+            if isinstance(val_loss, torch.Tensor):
+                val_loss = val_loss.item()
+
+        # Collect gradients for history
+        grads = {}
+        for key, val in self.param_dict.items():
+            if isinstance(val, dict):
+                grads[key] = {}
+                for subkey, subval in val.items():
+                    if isinstance(subval, torch.Tensor) and subval.grad is not None:
+                        if subval.ndim == 0:
+                            grads[key][subkey] = subval.grad.item()
+                        else:
+                            grads[key][subkey] = subval.grad.detach().cpu().numpy()
+            elif isinstance(val, torch.Tensor) and val.grad is not None:
+                if val.ndim == 0:
+                    grads[key] = val.grad.item()
+                else:
+                    grads[key] = val.grad.detach().cpu().numpy()
 
         # update optimization history
-        self.train_loss_history.append(train_loss)
-        self.val_loss_history.append(val_loss)
-        self.param_history.append(fix_jax_dict_floats(updated_params))
-        self.grad_history.append(fix_jax_dict_floats(grads))
+        self.train_loss_history.append(float(train_loss))
+        self.val_loss_history.append(float(val_loss))
+        self.param_history.append(updated_params)  # Already detached/converted
+        self.grad_history.append(fix_torch_dict_floats(grads))
 
         # evaluate the model, check for improvement, report speed
         is_improvement = self.check_progress(
@@ -227,12 +321,12 @@ class GradientBasedOptimizer(OptimizerBase):
 
 class SGD(GradientBasedOptimizer):
     def __init__(self, **kwargs):
-        super().__init__(alg=sgd, **kwargs)
+        super().__init__(alg="sgd", **kwargs)
         self.id = "SGD"
 
 
 class Adam(GradientBasedOptimizer):
     def __init__(self, b1=0.9, b2=0.999, eps=1e-08, **kwargs):
-        super().__init__(alg=adam, **kwargs)
+        super().__init__(alg="adam", **kwargs)
         self.id = "Adam"
         self.alg_args = {"b1": b1, "b2": b2, "eps": eps}

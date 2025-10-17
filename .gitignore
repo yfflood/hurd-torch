@@ -1,3 +1,5 @@
+.vscode/
+
 # Custom (not from github python defaults)
 *.p
 *.pickle

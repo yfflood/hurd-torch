@@ -1,11 +1,16 @@
 from abc import ABC, abstractmethod
 
 import numpy as np
-import jax.numpy as jnp
-from jax import vmap
-from jax.nn import sigmoid
+import torch
 
 from ..utils import glorot_uniform_init, setup_plotting
+
+
+def _ensure_tensor(value):
+    """Convert value to tensor if it isn't already, preserving gradients."""
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.tensor(value, dtype=torch.float32)
 
 
 class WeightingBase(ABC):
@@ -19,6 +24,19 @@ class WeightingBase(ABC):
         )
 
     def __call__(self, p):
+        if isinstance(p, np.ndarray):
+            p = torch.from_numpy(p).float()
+        elif not isinstance(p, torch.Tensor):
+            p = torch.tensor(p, dtype=torch.float32)
+        
+        # Move to same device if needed (infer from parameters if they exist)
+        if hasattr(self, 'parameters') and self.parameters:
+            # Try to get device from first parameter
+            for param_val in self.parameters.values():
+                if isinstance(param_val, torch.Tensor):
+                    p = p.to(param_val.device)
+                    break
+        
         return self.forward(p)
 
     @abstractmethod
@@ -38,25 +56,34 @@ class WeightingBase(ABC):
     def apply_fn_excluding_zeros_and_ones(self, probs):
         """ Most probability weighting functions are 
             only applied to 0 > values > 1. This function
-            handles this in a jax-compatible way.
+            handles this in a torch-compatible way.
         """
+        # Ensure probs is a tensor
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
+        # IMPORTANT: For plotting - ensure probs is on same device as parameters
+        for param_val in self.parameters.values():
+            if isinstance(param_val, torch.Tensor):
+                probs = probs.to(param_val.device)
+                break
 
         # all probs that are either 0 or 1
-        zeros_and_ones_mask = (probs == 0) + (probs == 1)
+        zeros_and_ones_mask = ((probs == 0) + (probs == 1)).float()
 
         # only zeros and ones, all else is also zero
         probs_only_zeros_and_ones = probs * zeros_and_ones_mask
 
         # now, the opposite, set 0s and 1s to 0
-        probs_no_zeros_or_ones = probs * ~zeros_and_ones_mask
+        probs_no_zeros_or_ones = probs * (1 - zeros_and_ones_mask)
         # add 0.5 so all 0/1's are now 0.5
-        probs_no_zeros_or_ones += zeros_and_ones_mask * (jnp.ones(probs.shape) * 0.5)
+        probs_no_zeros_or_ones += zeros_and_ones_mask * (torch.ones_like(probs) * 0.5)
 
         # apply the probability weighting function
         probs_no_zeros_or_ones = self._forward(probs_no_zeros_or_ones)
 
         # remove the transformed 0.5 junk
-        probs_no_zeros_or_ones *= ~zeros_and_ones_mask
+        probs_no_zeros_or_ones = probs_no_zeros_or_ones * (1 - zeros_and_ones_mask)
 
         # add the ones back at the end
         return probs_no_zeros_or_ones + probs_only_zeros_and_ones
@@ -68,6 +95,11 @@ class WeightingBase(ABC):
         if p is None:
             p = np.linspace(0, 1, 100)
         w = self.forward(p)
+        
+        # Convert tensor output to numpy for plotting
+        if isinstance(w, torch.Tensor):
+            w = w.detach().cpu().numpy()
+        
         ax.plot(p, w)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
@@ -125,8 +157,15 @@ class KT_PWF(WeightingBase):
         self.id = "KT_PWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha = self.parameters["alpha"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         # assert alpha >= 0.28, "`alpha` must be greater than 0.28"
 
@@ -167,8 +206,15 @@ class LogOddsLinearPWF(WeightingBase):
         self.id = "LogOddsLinearPWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         self._forward = lambda p: (beta * p ** alpha) / (
             beta * p ** alpha + (1 - p) ** alpha
@@ -206,8 +252,15 @@ class PowerPWF(WeightingBase):
         self.id = "PowerPWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         self._forward = lambda p: beta * p ** alpha
 
@@ -249,8 +302,15 @@ class NeoAdditivePWF(WeightingBase):
         self.id = "NeoAdditivePWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         # assert alpha >= 0, "`alpha` must be greater than or equal to 0"
         # assert beta >= 0, "`beta` must be greater than or equal to 0"
@@ -300,13 +360,20 @@ class HyperbolicLogPWF(WeightingBase):
         self.id = "HyperbolicLogPWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         # assert alpha > 0, "`alpha` must be greater than 0"
         # assert beta > 0, "`beta` must be greater than 0"
 
-        self._forward = lambda p: (1 - alpha * jnp.log(p)) ** (-beta / alpha)
+        self._forward = lambda p: (1 - alpha * torch.log(p)) ** (-beta / alpha)
 
         return self.apply_fn_excluding_zeros_and_ones(probs)
 
@@ -357,7 +424,7 @@ class ExponentialPowerPWF(WeightingBase):
         # assert alpha != 0, "`alpha` must not be 0"
         # assert beta > 0, "`beta` must be greater than 0"
 
-        self._forward = lambda p: jnp.exp((-alpha / beta) * (1 - p ** beta))
+        self._forward = lambda p: torch.exp((-alpha / beta) * (1 - p ** beta))
 
         return self.apply_fn_excluding_zeros_and_ones(probs)
 
@@ -403,13 +470,20 @@ class CompoundInvariancePWF(WeightingBase):
         self.id = "CompoundInvariancePWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         # assert alpha > 0, "`alpha` must be greater than 0"
         # assert beta > 0, "`beta` must be greater than 0"
 
-        self._forward = lambda p: jnp.exp(-beta * ((-jnp.log(p)) ** alpha))
+        self._forward = lambda p: torch.exp(-beta * ((-torch.log(p)) ** alpha))
 
         return self.apply_fn_excluding_zeros_and_ones(probs)
 
@@ -449,14 +523,21 @@ class ConstantRelativeSensitivityPWF(WeightingBase):
         self.id = "ConstantRelativeSensitivityPWF"
 
     def forward(self, probs):
-
+        # Ensure probs is a tensor (for plotting compatibility)
+        if not isinstance(probs, torch.Tensor):
+            probs = torch.from_numpy(probs).float()
+        
         alpha, beta = self.parameters["alpha"], self.parameters["beta"]
+        
+        # Move probs to same device as alpha if needed
+        if isinstance(alpha, torch.Tensor) and probs.device != alpha.device:
+            probs = probs.to(alpha.device)
 
         # assert alpha > 0, "`alpha` must be greater than 0"
         # assert 0 <= beta <= 1, "`beta` must be in range [0, 1]"
 
         # track probs where p <= beta
-        p_leq_beta_mask = probs <= beta
+        p_leq_beta_mask = (probs <= beta).float()
         # set all others to zero so we can replace them later
         p_leq_beta_probs = probs * p_leq_beta_mask
         # weight these probs how they need to be
@@ -465,7 +546,7 @@ class ConstantRelativeSensitivityPWF(WeightingBase):
         p_leq_beta_probs = probs * p_leq_beta_mask
 
         # now focus on what we zeroed out before
-        p_g_beta_mask = ~p_leq_beta_mask
+        p_g_beta_mask = 1 - p_leq_beta_mask
         # set others to zero
         p_g_beta_probs = probs * p_g_beta_mask
         # now weight these how they need to be (differently)
@@ -500,15 +581,28 @@ class NeuralNetworkPWF(WeightingBase):
     def forward(self, probs):
         w1, w2 = self.parameters["weights"]
         b1, b2 = self.parameters["biases"]
+        
+        # Convert to tensors if needed
+        if not isinstance(w1, torch.Tensor):
+            w1 = torch.from_numpy(w1).float()
+        if not isinstance(w2, torch.Tensor):
+            w2 = torch.from_numpy(w2).float()
+        if not isinstance(b1, torch.Tensor):
+            b1 = torch.from_numpy(b1).float()
+        if not isinstance(b2, torch.Tensor):
+            b2 = torch.from_numpy(b2).float()
 
         def nn(prob):
-            hidden = sigmoid(jnp.dot(w1, prob) + b1)
-            output = sigmoid(jnp.dot(w2, hidden) + b2)
+            hidden = torch.sigmoid(torch.matmul(w1, prob) + b1)
+            output = torch.sigmoid(torch.matmul(w2, hidden) + b2)
             return output
 
-        nn = vmap(nn)
-
+        # PyTorch vmap equivalent using list comprehension and stacking
         orig_shape = probs.shape
-        outputs = nn(probs.flatten()).reshape(orig_shape)
+        flat_probs = probs.flatten()
+        
+        # Process each probability through the network
+        outputs = torch.stack([nn(prob) for prob in flat_probs])
+        outputs = outputs.reshape(orig_shape)
 
         return outputs
