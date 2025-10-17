@@ -1,8 +1,10 @@
-# Human Risky Decision-Making (HURD) Toolkit
+# Human Risky Decision-Making (HURD) Toolkit with PyTorch Backend
+
+This reporsitory is a fork of the original [HURD](https://github.com/jcpeterson/hurd) repository, with the backend changed from JAX to PyTorch.
 
 **NOTE:** HURD is currently in a pre-release state and thus may contain bugs while being actively developed. We are currently working on more complete documentation. For now, see the quick start guide in the `tutorials` folder.
 
-HURD implements the Mixture of Theories (MOT) model of human risky decision-making along with several other models and baselines (e.g., Prospect Theory) from the paper listed below using Python and jax. It was written by Joshua Peterson and David Bourgin, and is currently a work in progress.
+HURD implements the Mixture of Theories (MOT) model of human risky decision-making along with several other models and baselines (e.g., Prospect Theory) from the paper listed below using Python and PyTorch. It was written by Joshua Peterson and David Bourgin, and is currently a work in progress.
 
 > Peterson, J. C., Bourgin, D. D., Agrawal, M., Reichman, D., & Griffiths, T. L. (2021). Using large-scale experiments and machine learning to discover theories of human decision-making. *Science*, *372*(6547), 1209-1214.
 
@@ -36,7 +38,7 @@ splitter = human_data.split(p=0.9, n_splits=1, shuffle=True, random_state=1)
 (train_data, val_data) = list(splitter)[0]
 
 # setup an optimizer
-optimizer = Adam(lr=0.01, n_iters=2000, use_jit=True)
+optimizer = Adam(lr=0.01, n_iters=2000)
 
 # initialize a model
 model = MixtureOfTheories(
@@ -52,9 +54,9 @@ More examples can be found in the `tutorials` folder of this repository.
 
 # Requirements
 
-The most important requirement for HURD is JAX, which is used for general comutation, differentiation, and Just In Time (JIT) compilation for speed.
+The most important requirement for HURD-torch is PyTorch, which is used for general comutation and differentiation.
 
-The rest of the requirements are specified in `requirements.txt`.
+The requirements are specified in `requirements.txt`.
 
 # License
 
